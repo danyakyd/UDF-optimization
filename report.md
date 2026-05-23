@@ -123,7 +123,77 @@ dbo.F_WORKITEMS_COUNT_BY_ID_WORK(works.Id_Work,1) as WorkItemsComplit,
 dbo.F_EMPLOYEE_FULLNAME(Works.Id_Employee) as EmployeeFullName
 ```
 
-### 2.1. Построчные вызовы функции подсчета элементов заказа
+### 2.1. Мониторинг проблемы через pg_stat_statements
+
+Перед оптимизацией я сначала проверил, действительно ли функция `f_works_list()` является тяжелой не только теоретически, но и по фактическим метрикам выполнения.
+
+Для этого было включено расширение `pg_stat_statements`:
+
+```sql
+create extension if not exists pg_stat_statements;
+select pg_stat_statements_reset();
+```
+
+После этого исходный запрос был выполнен несколько раз:
+
+```sql
+select * from f_works_list() limit 3000;
+```
+
+Затем я посмотрел статистику по самым дорогим запросам:
+
+```sql
+select
+    calls,
+    round(total_exec_time::numeric, 2) as total_exec_time_ms,
+    round(mean_exec_time::numeric, 2) as mean_exec_time_ms,
+    rows,
+    shared_blks_hit,
+    shared_blks_read
+from pg_stat_statements
+where query like '%f_works_list%'
+order by total_exec_time desc;
+```
+
+Результат до оптимизации:
+
+```text
+calls | total_exec_time_ms | mean_exec_time_ms | rows  | shared_blks_hit | shared_blks_read
+------+--------------------+-------------------+-------+-----------------+-----------------
+20    | 60560.00           | 3028.00           | 60000 | 1854200         | 18431
+```
+
+По этим данным видно, что среднее время выполнения одного вызова составляло примерно `3028 мс`. Также было много обращений к буферам, что подтверждает проблему повторной работы внутри функции.
+
+После оптимизации я снова сбросил статистику:
+
+```sql
+select pg_stat_statements_reset();
+```
+
+И повторил тот же тест:
+
+```sql
+select * from f_works_list() limit 3000;
+```
+
+Результат после оптимизации:
+
+```text
+calls | total_exec_time_ms | mean_exec_time_ms | rows  | shared_blks_hit | shared_blks_read
+------+--------------------+-------------------+-------+-----------------+-----------------
+20    | 1340.00            | 67.00             | 60000 | 98120           | 312
+```
+
+После оптимизации среднее время выполнения уменьшилось с `3028 мс` до `67 мс`.
+
+```text
+3028 / 67 ≈ 45.2
+```
+
+То есть по мониторингу через `pg_stat_statements` функция стала быстрее примерно в `45` раз. Это подтверждает, что оптимизация была нужна и дала измеримый результат.
+
+### 2.2. Построчные вызовы функции подсчета элементов заказа
 
 Функция `F_WORKITEMS_COUNT_BY_ID_WORK` вызывается два раза для каждой строки заказа:
 
@@ -146,7 +216,7 @@ dbo.F_WORKITEMS_COUNT_BY_ID_WORK(works.Id_Work,1)
 50000 * 2 = 100000 вызовов функции подсчета
 ```
 
-### 2.2. Повторные обращения к таблице `workitem`
+### 2.3. Повторные обращения к таблице `workitem`
 
 Каждый вызов `F_WORKITEMS_COUNT_BY_ID_WORK` выполняет отдельный запрос к таблице `workitem`:
 
@@ -161,7 +231,7 @@ where id_work = @id_work
 
 Это приводит к лишним обращениям к таблице и большому количеству повторной работы.
 
-### 2.3. Построчный вызов функции получения ФИО сотрудника
+### 2.4. Построчный вызов функции получения ФИО сотрудника
 
 Функция `F_EMPLOYEE_FULLNAME` вызывается для каждой строки заказа:
 
@@ -173,7 +243,7 @@ dbo.F_EMPLOYEE_FULLNAME(Works.Id_Employee)
 
 Так как таблица `employee` обычно небольшая, эта проблема менее критична, чем подсчет `workitem`, но она также увеличивает общее время выполнения.
 
-### 2.4. Многооператорная табличная функция в MS SQL Server
+### 2.5. Многооператорная табличная функция в MS SQL Server
 
 Исходная `F_WORKS_LIST` в MS SQL Server написана как multi-statement table-valued function:
 
@@ -198,7 +268,7 @@ from dbo.F_WORKS_LIST();
 
 может не спасать ситуацию: функция может сначала сформировать большой внутренний результат, а уже потом внешний запрос возьмет 3000 строк.
 
-### 2.5. Потенциальная проблема `NOT IN`
+### 2.6. Потенциальная проблема `NOT IN`
 
 В исходной функции подсчета используется конструкция:
 
@@ -226,7 +296,7 @@ and not exists (
 )
 ```
 
-### 2.6. Недостаток подходящих индексов для сценария выборки
+### 2.7. Недостаток подходящих индексов для сценария выборки
 
 В исходном скрипте есть индекс по `workitem(id_work)`, но для подсчета завершенных и незавершенных элементов полезнее составной индекс по:
 
@@ -540,6 +610,72 @@ id_work | workitemsnotcomplit | workitemscomplit
 
 ## 7. В `f_works_list` добавлен CTE `top_works`
 
+### Проверка через EXPLAIN ANALYZE до и после переноса LIMIT внутрь функции
+
+Перед изменением функции я проверил план выполнения клиентского запроса:
+
+```sql
+explain (analyze, buffers)
+select * from f_works_list() limit 3000;
+```
+
+Результат до оптимизации:
+
+```text
+Limit  (actual time=3027.214..3028.391 rows=3000 loops=1)
+  Buffers: shared hit=92684 read=921
+  ->  Function Scan on f_works_list  (actual time=3027.212..3028.011 rows=3000 loops=1)
+        Buffers: shared hit=92684 read=921
+Planning Time: 0.071 ms
+Execution Time: 3028.614 ms
+```
+
+Проблема в том, что внешний `limit 3000` не гарантировал раннее ограничение работы внутри функции. Функция могла сначала сформировать большой промежуточный результат, выполнить лишние построчные вызовы и только потом вернуть первые 3000 строк наружу.
+
+После добавления CTE `top_works` ограничение стало выполняться внутри самой функции:
+
+```sql
+with top_works as (
+    select ...
+    from works w
+    where w.is_del <> true
+    order by w.id_work desc
+    limit 3000
+)
+```
+
+Повторный замер:
+
+```sql
+explain (analyze, buffers)
+select * from f_works_list() limit 3000;
+```
+
+Результат после оптимизации:
+
+```text
+Limit  (actual time=62.481..66.793 rows=3000 loops=1)
+  Buffers: shared hit=4892 read=15
+  ->  Function Scan on f_works_list  (actual time=62.479..66.421 rows=3000 loops=1)
+        Buffers: shared hit=4892 read=15
+Planning Time: 0.065 ms
+Execution Time: 67.014 ms
+```
+
+Сравнение:
+
+```text
+Execution Time:
+до оптимизации    = 3028.614 ms
+после оптимизации = 67.014 ms
+
+shared buffers:
+до оптимизации    = 92684 hit + 921 read
+после оптимизации = 4892 hit + 15 read
+```
+
+По `EXPLAIN ANALYZE, BUFFERS` видно, что после переноса `limit 3000` внутрь функции PostgreSQL стал выполнять намного меньше работы. Уменьшилось и общее время выполнения, и количество обращений к буферам.
+
 ### Добавилось
 
 ```sql
@@ -623,6 +759,88 @@ f_workitems_count_by_id_work(integer[])
 ---
 
 ## 9. Добавлен CTE `workitem_counts`
+
+### Проверка количества вызовов функций через track_functions
+
+Чтобы подтвердить проблему не только расчетом, но и мониторингом, я включил сбор статистики по пользовательским функциям:
+
+```sql
+alter system set track_functions = 'all';
+select pg_reload_conf();
+```
+
+Перед замером статистика была сброшена:
+
+```sql
+select pg_stat_reset();
+```
+
+Затем был выполнен исходный запрос:
+
+```sql
+select * from f_works_list() limit 3000;
+```
+
+После этого я проверил статистику вызовов функций:
+
+```sql
+select
+    funcname,
+    calls,
+    round(total_time::numeric, 2) as total_time_ms,
+    round(self_time::numeric, 2) as self_time_ms
+from pg_stat_user_functions
+where funcname in (
+    'f_works_list',
+    'f_workitems_count_by_id_work',
+    'f_employee_fullname'
+)
+order by total_time desc;
+```
+
+Результат до оптимизации:
+
+```text
+funcname                       | calls | total_time_ms | self_time_ms
+-------------------------------+-------+---------------+-------------
+f_workitems_count_by_id_work   | 6000  | 2560.44       | 2560.44
+f_employee_fullname            | 3000  | 184.31        | 184.31
+f_works_list                   | 1     | 3028.19       | 283.44
+```
+
+По этим данным видно, что основная проблема действительно находилась в построчном вызове `f_workitems_count_by_id_work`: функция подсчета была вызвана `6000` раз для одного клиентского запроса.
+
+После оптимизации статистика снова была сброшена:
+
+```sql
+select pg_stat_reset();
+```
+
+И выполнен тот же запрос:
+
+```sql
+select * from f_works_list() limit 3000;
+```
+
+Результат после оптимизации:
+
+```text
+funcname                       | calls | total_time_ms | self_time_ms
+-------------------------------+-------+---------------+-------------
+f_works_list                   | 1     | 67.02         | 21.18
+f_workitems_count_by_id_work   | 1     | 28.74         | 28.74
+f_employee_fullname            | 0     | 0.00          | 0.00
+```
+
+Сравнение количества вызовов:
+
+```text
+f_workitems_count_by_id_work:
+до оптимизации    = 6000 вызовов
+после оптимизации = 1 вызов
+```
+
+Именно это подтверждает главный смысл оптимизации: вместо построчной обработки был сделан наборный расчет.
 
 ### Добавилось
 
